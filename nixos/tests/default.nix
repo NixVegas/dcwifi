@@ -1,0 +1,261 @@
+{
+  lib,
+  pkgs,
+  testers,
+  self,
+  ...
+}:
+
+let
+  ssid = "DefCon";
+  wlan = "wlan0";
+  hostName = "client";
+
+  # vwifi hub address + ports (see the kismet NixOS test for the topology).
+  hubAddress = "192.168.1.1";
+  vwifiTcp = 8212;
+
+  # A test CA + server cert whose CN/SANs satisfy the module's hard-coded
+  # subject_match="CN=wifireg.defcon.org" / altsubject_match=DNS:wifi.defcon.org,
+  # DNS:wifireg.defcon.org, so the client's PEAP server-cert validation passes.
+  certs = pkgs.runCommand "dcwifi-test-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p "$out"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout "$out/ca.key" -out "$out/ca.crt" -subj "/CN=dcwifi-test-ca"
+    openssl req -newkey rsa:2048 -nodes \
+      -keyout "$out/server.key" -out "$out/server.csr" -subj "/CN=wifireg.defcon.org"
+    cat > ext.cnf <<EOF
+    subjectAltName = DNS:wifireg.defcon.org, DNS:wifi.defcon.org
+    extendedKeyUsage = serverAuth
+    EOF
+    openssl x509 -req -in "$out/server.csr" -CA "$out/ca.crt" -CAkey "$out/ca.key" \
+      -CAcreateserial -days 3650 -extfile ext.cnf -out "$out/server.crt"
+  '';
+
+  # Fake wifireg backend. Mirrors what wifi-reg.sh POSTs: a urlencoded body of
+  # username/password/password2/submit=REGISTER. Validates the shape, records
+  # "username=password" (so the test can read back what was registered and feed
+  # it to hostapd), and 200s only on a well-formed REGISTER.
+  fakeWifireg = pkgs.writers.writePython3 "fake-wifireg" { flakeIgnore = [ "E501" ]; } ''
+    import os
+    import urllib.parse
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    LOG = "/var/lib/wifireg/registrations"
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            form = urllib.parse.parse_qs(self.rfile.read(n).decode())
+
+            def one(k):
+                v = form.get(k, [])
+                return v[0] if v else None
+
+            user, pw, pw2, submit = one("username"), one("password"), one("password2"), one("submit")
+            if not user or not pw or pw != pw2 or submit != "REGISTER":
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"bad request\n")
+                return
+
+            os.makedirs(os.path.dirname(LOG), exist_ok=True)
+            with open(LOG, "a") as f:
+                f.write(user + "=" + pw + "\n")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"registered\n")
+
+        def log_message(self, *a):
+            pass
+
+
+    HTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+  '';
+
+  # Every node with a virtual radio joins the vwifi hub.
+  vwifiClient = macPrefix: {
+    services.vwifi = {
+      module = {
+        enable = true;
+        inherit macPrefix;
+      };
+      client = {
+        enable = true;
+        serverAddress = hubAddress;
+      };
+    };
+  };
+  eth1 = addr: {
+    networking.interfaces.eth1.ipv4.addresses = lib.mkForce [
+      {
+        address = addr;
+        prefixLength = 24;
+      }
+    ];
+  };
+in
+testers.runNixOSTest {
+  name = "dcwifi";
+
+  nodes = {
+    # Fake registration portal + the vwifi hub.
+    wifireg =
+      { ... }:
+      lib.mkMerge [
+        (eth1 hubAddress)
+        {
+          services.vwifi.server = {
+            enable = true;
+            ports.tcp = vwifiTcp;
+            openFirewall = true;
+          };
+          networking.firewall.allowedTCPPorts = [ 80 ];
+          systemd.services.wifireg = {
+            description = "fake wifireg backend";
+            wantedBy = [ "multi-user.target" ];
+            serviceConfig = {
+              ExecStart = "${fakeWifireg}";
+              StateDirectory = "wifireg";
+            };
+          };
+        }
+      ];
+
+    # WPA2-Enterprise AP acting as its own EAP server (PEAP/MSCHAPV2). The
+    # structured hostapd module has no enterprise auth mode, so use mode="none"
+    # and define the whole 802.1X/EAP server via freeform settings. hostapd is
+    # NOT started at boot: the eap_user file is written by the test (with the
+    # creds the client actually registers) before it's brought up.
+    ap =
+      { ... }:
+      lib.mkMerge [
+        (eth1 "192.168.1.2")
+        (vwifiClient "02:00:00:00:01")
+        {
+          systemd.services.hostapd.wantedBy = lib.mkForce [ ];
+          services.hostapd = {
+            enable = true;
+            radios.${wlan} = {
+              band = "2g";
+              channel = 1;
+              networks.${wlan} = {
+                inherit ssid;
+                authentication.mode = "none";
+                settings = {
+                  wpa = 2;
+                  wpa_key_mgmt = "WPA-EAP";
+                  rsn_pairwise = "CCMP";
+                  ieee8021x = 1;
+                  eap_server = 1;
+                  eap_user_file = "/etc/hostapd.eap_user";
+                  ca_cert = "${certs}/ca.crt";
+                  server_cert = "${certs}/server.crt";
+                  private_key = "${certs}/server.key";
+                };
+              };
+            };
+          };
+        }
+      ];
+
+    # The device under test: the dcwifi module, pointed at the fake portal, with
+    # its PEAP server-cert trust anchored on the test CA.
+    client =
+      { ... }:
+      {
+        imports = [ self.nixosModules.default ];
+        config = lib.mkMerge [
+          (eth1 "192.168.1.3")
+          (vwifiClient "02:00:00:00:02")
+          {
+            networking.hostName = hostName;
+            nixVegas.dcWifi.caCert = "${certs}/ca.crt";
+            # The test framework forces wireless off via mkVMOverride (prio 10),
+            # which beats the module's mkDefault; force it back on like the
+            # kismet test's station does.
+            networking.wireless.enable = lib.mkOverride 0 true;
+            networking.wireless.interfaces = [ wlan ];
+            # Point registration at the fake portal instead of wifireg.defcon.org.
+            systemd.services.nixvegas-dc-wifi-registration.environment.WIFIREG_BASE =
+              lib.mkForce "http://${hubAddress}/";
+          }
+        ];
+      };
+  };
+
+  testScript = { nodes, ... }: ''
+    reg_unit = "nixvegas-dc-wifi-registration.service"
+    secrets = "${nodes.client.networking.wireless.secretsFile}"
+    secret_name = "${nodes.client.nixVegas.dcWifi.secretName}"
+    user = "${nodes.client.nixVegas.dcWifi.username}"
+
+    wifireg.start()
+    wifireg.wait_for_unit("wifireg.service")
+    wifireg.wait_for_open_port(80)
+    wifireg.wait_for_unit("vwifi-server.service")
+    wifireg.wait_for_open_port(${toString vwifiTcp})
+
+    client.start()
+    client.wait_for_unit("multi-user.target")
+
+    with subtest("registration"):
+      # Nothing registered yet.
+      client.succeed(f"test ! -e {secrets} || ! grep -q '^{secret_name}=' {secrets}")
+
+      # Run the oneshot; systemctl start blocks until it finishes.
+      client.succeed(f"systemctl start {reg_unit}")
+
+      # The secret was persisted, with a password matching the 16-24 alnum template.
+      client.succeed(f"grep -Eq '^{secret_name}=[0-9A-Za-z]{{16,24}}$' {secrets}")
+
+      # Secret is written by, owned by, and readable only by the wpa_supplicant user.
+      client.succeed(f"test $(stat -c '%a' {secrets}) = 600")
+      client.succeed(f"test $(stat -c '%U' {secrets}) = wpa_supplicant")
+
+      # The portal saw exactly that username, with password == password2.
+      wifireg.succeed(f"grep -Eq '^{user}=[0-9A-Za-z]{{16,24}}$' /var/lib/wifireg/registrations")
+
+      # The password the client stored is the one the portal received.
+      stored = client.succeed(f"sed -n 's/^{secret_name}=//p' {secrets}").strip()
+      received = wifireg.succeed(f"sed -n 's/^{user}=//p' /var/lib/wifireg/registrations").strip()
+      assert stored == received, f"stored {stored!r} != portal {received!r}"
+
+      # Idempotency: a second run must NOT re-register (secret already present).
+      client.succeed(f"systemctl start {reg_unit}")
+      count = int(wifireg.succeed(f"grep -c '^{user}=' /var/lib/wifireg/registrations").strip())
+      assert count == 1, f"expected 1 registration, got {count}"
+
+    with subtest("association"):
+      ap.start()
+      ap.wait_for_unit("vwifi-client.service")
+
+      # Teach the AP's EAP server the creds the client just registered, then bring
+      # hostapd up (its beacon SSID must match the module's "DefCon" network).
+      ap.succeed(
+          "printf '*\\tPEAP\\n\"%s\"\\tMSCHAPV2\\t\"%s\"\\t[2]\\n' "
+          f"{user} {stored} > /etc/hostapd.eap_user"
+      )
+      ap.succeed("systemctl start hostapd.service")
+      ap.wait_for_unit("hostapd.service")
+
+      # Poke association every so often until it registers
+      unit = "wpa_supplicant-${wlan}.service"
+      ctrl = "/run/wpa_supplicant/control"
+      client.wait_for_unit(unit)
+
+      connected = False
+      for i in range(60):
+          if i % 8 == 0:
+              client.succeed(f"wpa_cli -p {ctrl} -i ${wlan} reconfigure || true")
+          status, _ = client.execute(
+              f"journalctl -u {unit} | grep -Eqi '${wlan}: CTRL-EVENT-CONNECTED'"
+          )
+          if status == 0:
+              connected = True
+              break
+          client.sleep(2)
+      assert connected, "client never completed EAP association with the DefCon AP"
+  '';
+}
