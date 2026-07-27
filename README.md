@@ -23,6 +23,11 @@ Declarative DEF CON wifi registration.
             modules = [
                 # everything is automatic unless you want to change the defaults (below)
                 dcwifi.nixosModules.default
+
+                {
+                    # Module only activates on a system with wifi enabled
+                    networking.wireless.enable = true;
+                }
             ];
         };
     };

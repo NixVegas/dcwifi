@@ -90,7 +90,7 @@ in
       nixVegas.dcWifi.enable = mkDefault true;
     }
 
-    (mkIf cfg.enable {
+    (mkIf (cfg.enable && config.networking.wireless.enable) {
       systemd.timers."nixvegas-dc-wifi-registration" = {
         wantedBy = [ "timers.target" ];
         timerConfig = {
@@ -142,7 +142,6 @@ in
         "f ${config.networking.wireless.secretsFile} 0600 wpa_supplicant wpa_supplicant -"
       ];
       networking.wireless = {
-        enable = mkDefault true;
         fallbackToWPA2 = mkDefault false;
         allowAuxiliaryImperativeNetworks = mkDefault true;
         userControlled = mkDefault true;
