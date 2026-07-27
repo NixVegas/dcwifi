@@ -2,6 +2,9 @@
 
 Declarative DEF CON wifi registration.
 
+> [!WARNING]
+> Note that NetworkManager is currently not supported.
+
 ## Using it
 
 ```nix
