@@ -90,7 +90,12 @@ in
       nixVegas.dcWifi.enable = mkDefault true;
     }
 
-    (mkIf (cfg.enable && config.networking.wireless.enable) {
+    # Gate only on the module's own switch. Do NOT also gate on
+    # config.networking.wireless.enable: this block defines networking.wireless.*
+    # options, and reading a sibling wireless option to decide whether to define
+    # one creates an infinite recursion once the ISO/initrd build pulls the
+    # wireless submodule through environment.etc.
+    (mkIf cfg.enable {
       systemd.timers."nixvegas-dc-wifi-registration" = {
         wantedBy = [ "timers.target" ];
         timerConfig = {
