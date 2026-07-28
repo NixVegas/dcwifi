@@ -39,6 +39,10 @@ let
 
   # Secret name for Supplicant.
   secretName = "dc${toString config.nixVegas.defcon}_${cfg.username}_wifi_pass";
+
+  # Secret name for the random username (only used when randomUsername = true).
+  # The hostname-hash key is fine here even when the username itself is random, it's just used locally.
+  userSecretName = "dc${toString config.nixVegas.defcon}_${cfg.username}_wifi_user";
 in
 {
   options = {
@@ -78,6 +82,24 @@ in
           character random password.
         '';
       };
+      randomUsername = mkEnableOption ''
+        a random per-machine username, generated at registration time from
+        usernameFormat instead of the deterministic hostname-derived one. Needed
+        when many machines share a hostname (e.g. netboot), where the derived
+        username would collide. On the wpa_supplicant backend this needs an
+        identity=ext: supplicant patch, which is applied automatically via an
+        overlay; NetworkManager needs no patch (it substitutes the username into
+        the profile directly)
+      '';
+      usernameFormat = mkOption {
+        type = types.str;
+        default = "<random:16-24>";
+        description = ''
+          Template for the random username, using the same <random:min-max> /
+          <random:max> token as passwordTemplate. Only used when randomUsername
+          is true. Defaults to a 16-24 character random username.
+        '';
+      };
       caCert = mkOption {
         type = types.path;
         default = ./hellenic-academic-root-ca.crt;
@@ -98,6 +120,12 @@ in
   config = mkMerge [
     {
       nixVegas.dcWifi.enable = mkDefault true;
+      # Default random usernames on under NetworkManager: NM images (e.g. netboot)
+      # share a hostname, so the derived username would collide across machines,
+      # and NM needs no supplicant patch to use a random one (it's substituted
+      # into the profile directly). wpa_supplicant hosts stay deterministic by
+      # default, since there the random path pulls in the identity-ext patch.
+      nixVegas.dcWifi.randomUsername = mkDefault useNM;
     }
 
     (mkIf cfg.enable {
@@ -140,6 +168,11 @@ in
           WIFIREG_WPA_CTRL = "/run/wpa_supplicant/control";
           WIFIREG_NM_PROFILE = "DefCon";
           WIFIREG_BASE = mkDefault "https://wifireg.defcon.org/";
+          # Random-username mode: generate the username too, and store it under
+          # its own secret name for identity=ext:/envsubst to reference.
+          WIFIREG_RANDOM_USERNAME = if cfg.randomUsername then "1" else "0";
+          WIFIREG_USERNAME_TEMPLATE = cfg.usernameFormat;
+          WIFIREG_USER_SECRET_NAME = userSecretName;
         };
       };
       # Pre-create the secret (owned by the backend's user) so first boot has it:
@@ -164,7 +197,7 @@ in
             pairwise=CCMP
             auth_alg=OPEN
             eap=PEAP
-            identity="${cfg.username}"
+            ${if cfg.randomUsername then "identity=ext:${userSecretName}" else "identity=\"${cfg.username}\""}
             password=ext:${cfg.secretName}
             phase1="peaplabel=0"
             phase2="auth=MSCHAPV2"
@@ -190,7 +223,9 @@ in
           wifi-security.key-mgmt = "wpa-eap";
           "802-1x" = {
             eap = "peap";
-            identity = cfg.username;
+            # Random usernames are substituted from the secret file by envsubst;
+            # NM hands the identity to wpa_supplicant over D-Bus, so no patch needed.
+            identity = if cfg.randomUsername then "\${${userSecretName}}" else cfg.username;
             phase2-auth = "mschapv2";
             password = "\${${cfg.secretName}}";
             password-flags = 0;
@@ -200,6 +235,20 @@ in
           };
         };
       };
+    })
+
+    # A random username can't be baked into the wpa_supplicant config, so it's
+    # referenced as identity=ext:<name>. Stock wpa_supplicant only supports ext:
+    # for psk/password, so carry a small patch that extends it to identity.
+    # NetworkManager doesn't need this (it substitutes the username directly).
+    (mkIf (cfg.enable && cfg.randomUsername && !useNM) {
+      nixpkgs.overlays = [
+        (final: prev: {
+          wpa_supplicant = prev.wpa_supplicant.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [ ./wpa-supplicant-identity-ext.patch ];
+          });
+        })
+      ];
     })
   ];
 }

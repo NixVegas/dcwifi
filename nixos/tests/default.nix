@@ -196,6 +196,9 @@ testers.runNixOSTest {
           {
             networking.hostName = "nmclient";
             nixVegas.dcWifi.caCert = "${certs}/ca.crt";
+            # Pin deterministic to test the derived-username path (NM now defaults
+            # randomUsername on).
+            nixVegas.dcWifi.randomUsername = false;
             networking.networkmanager.enable = true;
             networking.wireless.enable = lib.mkOverride 0 true;
             networking.networkmanager.ensureProfiles.profiles.DefCon = {
@@ -204,6 +207,40 @@ testers.runNixOSTest {
             };
             # Keep NM off the wired test interfaces so the static vwifi-hub
             # address survives; NM only needs to manage the wifi radio.
+            networking.networkmanager.unmanaged = [
+              "interface-name:eth0"
+              "interface-name:eth1"
+            ];
+            systemd.services.nixvegas-dc-wifi-registration.environment.WIFIREG_BASE =
+              lib.mkForce "http://${hubAddress}/";
+          }
+        ];
+      };
+
+    # NetworkManager + random per-machine username (the netboot case): the module
+    # must generate + persist the username and substitute it into the NM profile
+    # (identity=${…}) via envsubst — no supplicant patch needed on this backend.
+    # (The wpa_supplicant identity=ext: patch path can't be exercised here: its
+    # overlay conflicts with the test framework's read-only nixpkgs; it's checked
+    # by a standalone build instead.)
+    randomclient =
+      { ... }:
+      {
+        imports = [ self.nixosModules.default ];
+        config = lib.mkMerge [
+          (eth1 "192.168.1.5")
+          (vwifiClient "02:00:00:00:04")
+          {
+            networking.hostName = "randomclient";
+            nixVegas.dcWifi.caCert = "${certs}/ca.crt";
+            # randomUsername is left unset: it defaults on under NM, so this node
+            # also exercises that default.
+            networking.networkmanager.enable = true;
+            networking.wireless.enable = lib.mkOverride 0 true;
+            networking.networkmanager.ensureProfiles.profiles.DefCon = {
+              ipv4.method = "link-local";
+              ipv6.method = "disabled";
+            };
             networking.networkmanager.unmanaged = [
               "interface-name:eth0"
               "interface-name:eth1"
@@ -228,6 +265,10 @@ testers.runNixOSTest {
     nm_name = "${nodes.nmclient.nixVegas.dcWifi.secretName}"
     nm_user = "${nodes.nmclient.nixVegas.dcWifi.username}"
 
+    rand_secrets = "${builtins.head nodes.randomclient.networking.networkmanager.ensureProfiles.environmentFiles}"
+    rand_pass_name = "${nodes.randomclient.nixVegas.dcWifi.secretName}"
+    rand_derived_user = "${nodes.randomclient.nixVegas.dcWifi.username}"
+
     wifireg.start()
     wifireg.wait_for_unit("wifireg.service")
     wifireg.wait_for_open_port(80)
@@ -236,8 +277,10 @@ testers.runNixOSTest {
 
     client.start()
     nmclient.start()
+    randomclient.start()
     client.wait_for_unit("multi-user.target")
     nmclient.wait_for_unit("multi-user.target")
+    randomclient.wait_for_unit("multi-user.target")
 
     with subtest("registration: wpa_supplicant backend"):
       # Nothing registered yet.
@@ -267,6 +310,17 @@ testers.runNixOSTest {
       nmclient.succeed(f"test $(stat -c '%a' {nm_secrets}) = 600")
       nmclient.succeed(f"test $(stat -c '%U' {nm_secrets}) = root")
       wifireg.succeed(f"grep -Eq '^{nm_user}=[0-9A-Za-z]{{16,24}}$' /var/lib/wifireg/registrations")
+
+    with subtest("registration: random username (networkmanager)"):
+      randomclient.wait_for_unit("NetworkManager.service")
+      randomclient.succeed(f"systemctl start {reg}")
+      # A random username was generated + persisted (16-24 alnum), plus the password.
+      randomclient.succeed(f"grep -Eq '_wifi_user=[0-9A-Za-z]{{16,24}}$' {rand_secrets}")
+      randomclient.succeed(f"grep -Eq '^{rand_pass_name}=[0-9A-Za-z]{{16,24}}$' {rand_secrets}")
+      rand_user = randomclient.succeed(f"sed -n 's/.*_wifi_user=//p' {rand_secrets}").strip()
+      # It is NOT the deterministic hostname-derived username, and the portal saw it.
+      assert rand_user != rand_derived_user, "username was not randomized"
+      wifireg.succeed("grep -q " + shlex.quote("^" + rand_user + "=") + " /var/lib/wifireg/registrations")
 
     with subtest("association: start hostapd"):
       ap.start()
@@ -311,5 +365,17 @@ testers.runNixOSTest {
                 break
             nmclient.sleep(2)
         assert nm_ok, "networkmanager client never activated the DefCon profile"
+
+      with subtest("association: random username (networkmanager)"):
+        # NM substitutes the random identity into the profile via envsubst and
+        # authenticates as the random username the AP now knows.
+        rand_ok = False
+        for _ in range(60):
+            st, _ = randomclient.execute("nmcli -w 5 connection up DefCon")
+            if st == 0:
+                rand_ok = True
+                break
+            randomclient.sleep(2)
+        assert rand_ok, "random-username networkmanager client never activated"
   '';
 }

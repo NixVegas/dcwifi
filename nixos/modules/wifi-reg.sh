@@ -97,6 +97,9 @@ for var in \
   WIFIREG_BACKEND \
   WIFIREG_WPA_CTRL \
   WIFIREG_NM_PROFILE \
+  WIFIREG_RANDOM_USERNAME \
+  WIFIREG_USERNAME_TEMPLATE \
+  WIFIREG_USER_SECRET_NAME \
   WIFIREG_BASE; do
   if [[ ! -v $var ]]; then
     echo "$var must be set" >&2
@@ -106,10 +109,16 @@ done
 
 if [ ! -f "$WIFIREG_SECRETS_FILE" ] \
   || ! grep -q "^${WIFIREG_SECRET_NAME}=" "$WIFIREG_SECRETS_FILE"; then
+  # A random per-machine username (for shared-hostname fleets), or the fixed one.
+  if [ "$WIFIREG_RANDOM_USERNAME" = "1" ]; then
+    username="$(substituteTemplate "$WIFIREG_USERNAME_TEMPLATE")"
+  else
+    username="$WIFIREG_USERNAME"
+  fi
   password="$(substituteTemplate "$WIFIREG_PASSWORD_TEMPLATE")"
 
   curl --silent --show-error --fail -LX POST --data-raw \
-    "username=${WIFIREG_USERNAME}&password=${password}&password2=${password}&submit=REGISTER" \
+    "username=${username}&password=${password}&password2=${password}&submit=REGISTER" \
     "$WIFIREG_BASE" || exit $?
 
   if [ ! -f "$WIFIREG_SECRETS_FILE" ]; then
@@ -119,8 +128,12 @@ if [ ! -f "$WIFIREG_SECRETS_FILE" ] \
   # secret is owned by that user; keep it readable only by the owner.
   chmod 0600 "$WIFIREG_SECRETS_FILE"
 
-  echo "Wifi registration is up, registered user '$WIFIREG_USERNAME'" >&2
+  echo "Wifi registration is up, registered user '$username'" >&2
   echo "# added by nixVegas.dcWifi" >> "$WIFIREG_SECRETS_FILE"
+  # Persist the random username too, so identity=ext:/envsubst can resolve it.
+  if [ "$WIFIREG_RANDOM_USERNAME" = "1" ]; then
+    echo "${WIFIREG_USER_SECRET_NAME}=$username" >> "$WIFIREG_SECRETS_FILE"
+  fi
   echo "${WIFIREG_SECRET_NAME}=$password" >> "$WIFIREG_SECRETS_FILE"
 
   # Nudge the active backend to pick up the new secret.

@@ -1,0 +1,161 @@
+--- a/src/eap_peer/eap_config.h
++++ b/src/eap_peer/eap_config.h
+@@ -652,6 +652,7 @@
+ #define EAP_CONFIG_FLAGS_EXT_PASSWORD BIT(1)
+ #define EAP_CONFIG_FLAGS_MACHINE_PASSWORD_NTHASH BIT(2)
+ #define EAP_CONFIG_FLAGS_EXT_MACHINE_PASSWORD BIT(3)
++#define EAP_CONFIG_FLAGS_EXT_IDENTITY BIT(4)
+ 	/**
+ 	 * flags - Network configuration flags (bitfield)
+ 	 *
+--- a/src/eap_peer/eap_i.h
++++ b/src/eap_peer/eap_i.h
+@@ -381,6 +381,7 @@
+ 
+ 	struct ext_password_data *ext_pw;
+ 	struct wpabuf *ext_pw_buf;
++	struct wpabuf *ext_identity_buf;
+ 
+ 	int external_sim;
+ 
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -1700,6 +1700,82 @@
+ #endif /* NO_CONFIG_WRITE */
+ 
+ 
++static int wpa_config_parse_identity(const struct parse_data *data,
++				     struct wpa_ssid *ssid, int line,
++				     const char *value)
++{
++	char *tmp;
++	size_t res_len;
++
++	if (os_strcmp(value, "NULL") == 0) {
++		if (!ssid->eap.identity)
++			return 1; /* Already unset */
++		wpa_printf(MSG_DEBUG, "Unset configuration string 'identity'");
++		os_free(ssid->eap.identity);
++		ssid->eap.identity = NULL;
++		ssid->eap.identity_len = 0;
++		return 0;
++	}
++
++#ifdef CONFIG_EXT_PASSWORD
++	if (os_strncmp(value, "ext:", 4) == 0) {
++		char *name = os_strdup(value + 4);
++
++		if (!name)
++			return -1;
++		os_free(ssid->eap.identity);
++		ssid->eap.identity = (u8 *) name;
++		ssid->eap.identity_len = os_strlen(name);
++		ssid->eap.flags |= EAP_CONFIG_FLAGS_EXT_IDENTITY;
++		return 0;
++	}
++#endif /* CONFIG_EXT_PASSWORD */
++
++	tmp = wpa_config_parse_string(value, &res_len);
++	if (!tmp) {
++		wpa_printf(MSG_ERROR, "Line %d: failed to parse identity.",
++			   line);
++		return -1;
++	}
++	wpa_hexdump_ascii(MSG_MSGDUMP, data->name, (u8 *) tmp, res_len);
++
++	os_free(ssid->eap.identity);
++	ssid->eap.identity = (u8 *) tmp;
++	ssid->eap.identity_len = res_len;
++#ifdef CONFIG_EXT_PASSWORD
++	ssid->eap.flags &= ~EAP_CONFIG_FLAGS_EXT_IDENTITY;
++#endif /* CONFIG_EXT_PASSWORD */
++
++	return 0;
++}
++
++
++#ifndef NO_CONFIG_WRITE
++static char * wpa_config_write_identity(const struct parse_data *data,
++					struct wpa_ssid *ssid)
++{
++	if (!ssid->eap.identity)
++		return NULL;
++
++#ifdef CONFIG_EXT_PASSWORD
++	if (ssid->eap.flags & EAP_CONFIG_FLAGS_EXT_IDENTITY) {
++		char *buf = os_zalloc(4 + ssid->eap.identity_len + 1);
++
++		if (!buf)
++			return NULL;
++		os_memcpy(buf, "ext:", 4);
++		os_memcpy(buf + 4, ssid->eap.identity,
++			  ssid->eap.identity_len);
++		return buf;
++	}
++#endif /* CONFIG_EXT_PASSWORD */
++
++	return wpa_config_write_string(ssid->eap.identity,
++				       ssid->eap.identity_len);
++}
++#endif /* NO_CONFIG_WRITE */
++
++
+ static int wpa_config_parse_password(const struct parse_data *data,
+ 				     struct wpa_ssid *ssid, int line,
+ 				     const char *value)
+@@ -2548,7 +2624,7 @@
+ 	{ INT(vht_center_freq2) },
+ #ifdef IEEE8021X_EAPOL
+ 	{ FUNC(eap) },
+-	{ STR_LENe(identity, identity) },
++	{ FUNC(identity) },
+ 	{ STR_LENe(anonymous_identity, anonymous_identity) },
+ 	{ STR_LENe(imsi_identity, imsi_identity) },
+ 	{ STR_LENe(machine_identity, machine_identity) },
+--- a/src/eap_peer/eap.c
++++ b/src/eap_peer/eap.c
+@@ -117,6 +117,8 @@
+ {
+ 	ext_password_free(sm->ext_pw_buf);
+ 	sm->ext_pw_buf = NULL;
++	ext_password_free(sm->ext_identity_buf);
++	sm->ext_identity_buf = NULL;
+ 
+ 	if (sm->m == NULL || sm->eap_method_priv == NULL)
+ 		return;
+@@ -2814,6 +2816,26 @@
+ 		return config->machine_identity;
+ 	}
+ 
++#ifdef CONFIG_EXT_PASSWORD
++	if (config->flags & EAP_CONFIG_FLAGS_EXT_IDENTITY) {
++		char *name;
++
++		if (!config->identity)
++			return NULL;
++		name = os_zalloc(config->identity_len + 1);
++		if (!name)
++			return NULL;
++		os_memcpy(name, config->identity, config->identity_len);
++		ext_password_free(sm->ext_identity_buf);
++		sm->ext_identity_buf = ext_password_get(sm->ext_pw, name);
++		os_free(name);
++		if (!sm->ext_identity_buf)
++			return NULL;
++		*len = wpabuf_len(sm->ext_identity_buf);
++		return wpabuf_head(sm->ext_identity_buf);
++	}
++#endif /* CONFIG_EXT_PASSWORD */
++
+ 	*len = config->identity_len;
+ 	return config->identity;
+ }
+@@ -3269,6 +3291,8 @@
+ {
+ 	ext_password_free(sm->ext_pw_buf);
+ 	sm->ext_pw_buf = NULL;
++	ext_password_free(sm->ext_identity_buf);
++	sm->ext_identity_buf = NULL;
+ 	sm->ext_pw = ext;
+ }
+ 
