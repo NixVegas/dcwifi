@@ -142,7 +142,7 @@ in
           OnCalendar = "daily";
           Persistent = true;
           OnBootSec = "5m";
-          OnUnitActiveSec = "5m";
+          OnUnitActiveSec = "6h";
           Unit = "nixvegas-dc-wifi-registration.service";
         };
       };
