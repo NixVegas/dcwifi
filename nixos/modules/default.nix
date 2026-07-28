@@ -24,8 +24,18 @@ let
       hashString "sha256" "dcwifi:${toString config.nixVegas.defcon}:${config.networking.hostName}"
     );
 
-  # Default secrets file for Supplicant.
-  defaultSecretsFile = lib.mkDefault "/etc/nixvegas/dc${toString config.nixVegas.defcon}/${toLower config.networking.hostName}.env";
+  # Backend selection: use NetworkManager if it manages the host, otherwise the
+  # wpa_supplicant path. Both configure the same PEAP/MSCHAPV2 DefCon network.
+  useNM = config.networking.networkmanager.enable;
+
+  # The registration service (and the secret it writes) run as this user: root
+  # under NM (to drive nmcli and reload declarative profiles), otherwise the
+  # sandboxed wpa_supplicant user.
+  secretUser = if useNM then "root" else "wpa_supplicant";
+
+  # Secret file, written by the registration service and consumed by whichever
+  # backend is active (wpa_supplicant ext_password, or NM envsubst).
+  secretsFile = "/etc/nixvegas/dc${toString config.nixVegas.defcon}/${toLower config.networking.hostName}.env";
 
   # Secret name for Supplicant.
   secretName = "dc${toString config.nixVegas.defcon}_${cfg.username}_wifi_pass";
@@ -90,11 +100,6 @@ in
       nixVegas.dcWifi.enable = mkDefault true;
     }
 
-    # Gate only on the module's own switch. Do NOT also gate on
-    # config.networking.wireless.enable: this block defines networking.wireless.*
-    # options, and reading a sibling wireless option to decide whether to define
-    # one creates an infinite recursion once the ISO/initrd build pulls the
-    # wireless submodule through environment.etc.
     (mkIf cfg.enable {
       systemd.timers."nixvegas-dc-wifi-registration" = {
         wantedBy = [ "timers.target" ];
@@ -115,42 +120,42 @@ in
               runtimeInputs = [
                 pkgs.curl
                 pkgs.openssl
-                pkgs.wpa_supplicant # wpa_cli, to reconfigure over the control socket
-              ];
+              ]
+              ++ lib.optional useNM pkgs.networkmanager # nmcli
+              ++ lib.optional (!useNM) pkgs.wpa_supplicant; # wpa_cli
             };
           in
           {
-            # Run as the same user wpa_supplicant does: the secret it writes is
-            # then owned by (and only readable by) that user, and it can pick up
-            # the new secret over the control socket without root.
             Type = "oneshot";
-            User = "wpa_supplicant";
-            Group = "wpa_supplicant";
+            User = secretUser;
+            Group = secretUser;
             ExecStart = "${lib.getExe wifiReg}";
           };
         environment = {
           WIFIREG_USERNAME = cfg.username;
           WIFIREG_PASSWORD_TEMPLATE = cfg.passwordTemplate;
-          WIFIREG_SECRETS_FILE = config.networking.wireless.secretsFile;
+          WIFIREG_SECRETS_FILE = secretsFile;
           WIFIREG_SECRET_NAME = cfg.secretName;
-          # wpa_supplicant's control-socket dir; wpa_cli reconfigure lives here.
+          WIFIREG_BACKEND = if useNM then "networkmanager" else "wpa_supplicant";
           WIFIREG_WPA_CTRL = "/run/wpa_supplicant/control";
+          WIFIREG_NM_PROFILE = "DefCon";
           WIFIREG_BASE = mkDefault "https://wifireg.defcon.org/";
         };
       };
-      # The registration service (running as wpa_supplicant) writes the secret
-      # here, so the dir must be owned by that user. wpa_supplicant BindReadOnly-
-      # mounts the secretsFile, which fails to start if it doesn't exist yet, so
-      # pre-create an empty one for first boot (registration fills it in later).
+      # Pre-create the secret (owned by the backend's user) so first boot has it:
+      # wpa_supplicant BindReadOnly-mounts it, and NM's ensure-profiles loads it
+      # as an EnvironmentFile — both fail if it's missing. Registration fills it.
       systemd.tmpfiles.rules = [
-        "d ${builtins.dirOf config.networking.wireless.secretsFile} 0700 wpa_supplicant wpa_supplicant -"
-        "f ${config.networking.wireless.secretsFile} 0600 wpa_supplicant wpa_supplicant -"
+        "d ${builtins.dirOf secretsFile} 0700 ${secretUser} ${secretUser} -"
+        "f ${secretsFile} 0600 ${secretUser} ${secretUser} -"
       ];
+    })
+    (mkIf (cfg.enable && !useNM) {
       networking.wireless = {
         fallbackToWPA2 = mkDefault false;
         allowAuxiliaryImperativeNetworks = mkDefault true;
         userControlled = mkDefault true;
-        secretsFile = defaultSecretsFile;
+        secretsFile = secretsFile;
         networks."DefCon" = {
           priority = mkDefault 5;
           authProtocols = mkDefault (singleton "WPA-EAP");
@@ -160,13 +165,39 @@ in
             auth_alg=OPEN
             eap=PEAP
             identity="${cfg.username}"
-            password=ext:${secretName}
+            password=ext:${cfg.secretName}
             phase1="peaplabel=0"
             phase2="auth=MSCHAPV2"
             ca_cert="${cfg.caCert}"
             subject_match="CN=wifireg.defcon.org"
             altsubject_match="DNS:wifi.defcon.org;DNS:wifireg.defcon.org"
           '';
+        };
+      };
+    })
+    (mkIf (cfg.enable && useNM) {
+      networking.networkmanager.ensureProfiles = {
+        environmentFiles = [ secretsFile ];
+        profiles."DefCon" = {
+          connection = {
+            id = "DefCon";
+            type = "wifi";
+          };
+          wifi = {
+            ssid = "DefCon";
+            mode = "infrastructure";
+          };
+          wifi-security.key-mgmt = "wpa-eap";
+          "802-1x" = {
+            eap = "peap";
+            identity = cfg.username;
+            phase2-auth = "mschapv2";
+            password = "\${${cfg.secretName}}";
+            password-flags = 0;
+            ca-cert = toString cfg.caCert;
+            subject-match = "wifireg.defcon.org";
+            altsubject-matches = "DNS:wifi.defcon.org;DNS:wifireg.defcon.org";
+          };
         };
       };
     })

@@ -183,13 +183,50 @@ testers.runNixOSTest {
           }
         ];
       };
+
+    # The same module on a NetworkManager-managed host: it must auto-detect NM
+    # and configure a declarative NM profile instead of wpa_supplicant.
+    nmclient =
+      { ... }:
+      {
+        imports = [ self.nixosModules.default ];
+        config = lib.mkMerge [
+          (eth1 "192.168.1.4")
+          (vwifiClient "02:00:00:00:03")
+          {
+            networking.hostName = "nmclient";
+            nixVegas.dcWifi.caCert = "${certs}/ca.crt";
+            networking.networkmanager.enable = true;
+            networking.wireless.enable = lib.mkOverride 0 true;
+            networking.networkmanager.ensureProfiles.profiles.DefCon = {
+              ipv4.method = "link-local";
+              ipv6.method = "disabled";
+            };
+            # Keep NM off the wired test interfaces so the static vwifi-hub
+            # address survives; NM only needs to manage the wifi radio.
+            networking.networkmanager.unmanaged = [
+              "interface-name:eth0"
+              "interface-name:eth1"
+            ];
+            systemd.services.nixvegas-dc-wifi-registration.environment.WIFIREG_BASE =
+              lib.mkForce "http://${hubAddress}/";
+          }
+        ];
+      };
   };
 
   testScript = { nodes, ... }: ''
-    reg_unit = "nixvegas-dc-wifi-registration.service"
-    secrets = "${nodes.client.networking.wireless.secretsFile}"
-    secret_name = "${nodes.client.nixVegas.dcWifi.secretName}"
-    user = "${nodes.client.nixVegas.dcWifi.username}"
+    import shlex
+
+    reg = "nixvegas-dc-wifi-registration.service"
+
+    wpa_secrets = "${nodes.client.networking.wireless.secretsFile}"
+    wpa_name = "${nodes.client.nixVegas.dcWifi.secretName}"
+    wpa_user = "${nodes.client.nixVegas.dcWifi.username}"
+
+    nm_secrets = "${builtins.head nodes.nmclient.networking.networkmanager.ensureProfiles.environmentFiles}"
+    nm_name = "${nodes.nmclient.nixVegas.dcWifi.secretName}"
+    nm_user = "${nodes.nmclient.nixVegas.dcWifi.username}"
 
     wifireg.start()
     wifireg.wait_for_unit("wifireg.service")
@@ -198,64 +235,81 @@ testers.runNixOSTest {
     wifireg.wait_for_open_port(${toString vwifiTcp})
 
     client.start()
+    nmclient.start()
     client.wait_for_unit("multi-user.target")
+    nmclient.wait_for_unit("multi-user.target")
 
-    with subtest("registration"):
+    with subtest("registration: wpa_supplicant backend"):
       # Nothing registered yet.
-      client.succeed(f"test ! -e {secrets} || ! grep -q '^{secret_name}=' {secrets}")
-
+      client.succeed(f"test ! -e {wpa_secrets} || ! grep -q '^{wpa_name}=' {wpa_secrets}")
       # Run the oneshot; systemctl start blocks until it finishes.
-      client.succeed(f"systemctl start {reg_unit}")
-
-      # The secret was persisted, with a password matching the 16-24 alnum template.
-      client.succeed(f"grep -Eq '^{secret_name}=[0-9A-Za-z]{{16,24}}$' {secrets}")
-
-      # Secret is written by, owned by, and readable only by the wpa_supplicant user.
-      client.succeed(f"test $(stat -c '%a' {secrets}) = 600")
-      client.succeed(f"test $(stat -c '%U' {secrets}) = wpa_supplicant")
-
-      # The portal saw exactly that username, with password == password2.
-      wifireg.succeed(f"grep -Eq '^{user}=[0-9A-Za-z]{{16,24}}$' /var/lib/wifireg/registrations")
-
-      # The password the client stored is the one the portal received.
-      stored = client.succeed(f"sed -n 's/^{secret_name}=//p' {secrets}").strip()
-      received = wifireg.succeed(f"sed -n 's/^{user}=//p' /var/lib/wifireg/registrations").strip()
+      client.succeed(f"systemctl start {reg}")
+      # Secret persisted, password matches the 16-24 alnum template, owned 0600
+      # by the sandboxed wpa_supplicant user.
+      client.succeed(f"grep -Eq '^{wpa_name}=[0-9A-Za-z]{{16,24}}$' {wpa_secrets}")
+      client.succeed(f"test $(stat -c '%a' {wpa_secrets}) = 600")
+      client.succeed(f"test $(stat -c '%U' {wpa_secrets}) = wpa_supplicant")
+      # The portal saw that username with password == password2, and it matches.
+      wifireg.succeed(f"grep -Eq '^{wpa_user}=[0-9A-Za-z]{{16,24}}$' /var/lib/wifireg/registrations")
+      stored = client.succeed(f"sed -n 's/^{wpa_name}=//p' {wpa_secrets}").strip()
+      received = wifireg.succeed(f"sed -n 's/^{wpa_user}=//p' /var/lib/wifireg/registrations").strip()
       assert stored == received, f"stored {stored!r} != portal {received!r}"
+      # Idempotent: a second run must not re-register.
+      client.succeed(f"systemctl start {reg}")
+      n = int(wifireg.succeed(f"grep -c '^{wpa_user}=' /var/lib/wifireg/registrations").strip())
+      assert n == 1, f"expected 1 wpa registration, got {n}"
 
-      # Idempotency: a second run must NOT re-register (secret already present).
-      client.succeed(f"systemctl start {reg_unit}")
-      count = int(wifireg.succeed(f"grep -c '^{user}=' /var/lib/wifireg/registrations").strip())
-      assert count == 1, f"expected 1 registration, got {count}"
+    with subtest("registration: networkmanager backend"):
+      nmclient.wait_for_unit("NetworkManager.service")
+      nmclient.succeed(f"systemctl start {reg}")
+      nmclient.succeed(f"grep -Eq '^{nm_name}=[0-9A-Za-z]{{16,24}}$' {nm_secrets}")
+      # Runs as root under NM (needed for nmcli / profile reload).
+      nmclient.succeed(f"test $(stat -c '%a' {nm_secrets}) = 600")
+      nmclient.succeed(f"test $(stat -c '%U' {nm_secrets}) = root")
+      wifireg.succeed(f"grep -Eq '^{nm_user}=[0-9A-Za-z]{{16,24}}$' /var/lib/wifireg/registrations")
 
-    with subtest("association"):
+    with subtest("association: start hostapd"):
       ap.start()
       ap.wait_for_unit("vwifi-client.service")
 
-      # Teach the AP's EAP server the creds the client just registered, then bring
-      # hostapd up (its beacon SSID must match the module's "DefCon" network).
-      ap.succeed(
-          "printf '*\\tPEAP\\n\"%s\"\\tMSCHAPV2\\t\"%s\"\\t[2]\\n' "
-          f"{user} {stored} > /etc/hostapd.eap_user"
-      )
+      # Build the EAP user DB from every registration the portal recorded, so
+      # both clients' (username, password) pairs authenticate against the AP.
+      eap = "*\tPEAP\n"
+      for line in wifireg.succeed("cat /var/lib/wifireg/registrations").splitlines():
+          line = line.strip()
+          if not line or line.startswith("#"):
+              continue
+          u, pw = line.split("=", 1)
+          eap += f'"{u}"\tMSCHAPV2\t"{pw}"\t[2]\n'
+      ap.succeed("printf '%s' " + shlex.quote(eap) + " > /etc/hostapd.eap_user")
       ap.succeed("systemctl start hostapd.service")
       ap.wait_for_unit("hostapd.service")
 
-      # Poke association every so often until it registers
-      unit = "wpa_supplicant-${wlan}.service"
-      ctrl = "/run/wpa_supplicant/control"
-      client.wait_for_unit(unit)
+      with subtest("association: wpa_supplicant"):
+        # wpa_supplicant client: nudge with reconfigure (the module's own reload path).
+        wpa_unit = "wpa_supplicant-${wlan}.service"
+        ctrl = "/run/wpa_supplicant/control"
+        client.wait_for_unit(wpa_unit)
+        wpa_ok = False
+        for i in range(60):
+            if i % 8 == 0:
+                client.succeed(f"wpa_cli -p {ctrl} -i ${wlan} reconfigure || true")
+            st, _ = client.execute(f"journalctl -u {wpa_unit} | grep -Eqi '${wlan}: CTRL-EVENT-CONNECTED'")
+            if st == 0:
+                wpa_ok = True
+                break
+            client.sleep(2)
+        assert wpa_ok, "wpa_supplicant client never associated"
 
-      connected = False
-      for i in range(60):
-          if i % 8 == 0:
-              client.succeed(f"wpa_cli -p {ctrl} -i ${wlan} reconfigure || true")
-          status, _ = client.execute(
-              f"journalctl -u {unit} | grep -Eqi '${wlan}: CTRL-EVENT-CONNECTED'"
-          )
-          if status == 0:
-              connected = True
-              break
-          client.sleep(2)
-      assert connected, "client never completed EAP association with the DefCon AP"
+      with subtest("association: networkmanager"):
+        # NetworkManager client: activate the declarative DefCon profile.
+        nm_ok = False
+        for _ in range(60):
+            st, _ = nmclient.execute("nmcli -w 5 connection up DefCon")
+            if st == 0:
+                nm_ok = True
+                break
+            nmclient.sleep(2)
+        assert nm_ok, "networkmanager client never activated the DefCon profile"
   '';
 }

@@ -1,9 +1,6 @@
 # dcwifi
 
-Declarative DEF CON wifi registration.
-
-> [!WARNING]
-> Note that NetworkManager is currently not supported.
+Declarative DEF CON wifi registration using standard wpa_supplicant. Includes NetworkManager support.
 
 ## Using it
 

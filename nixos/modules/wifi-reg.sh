@@ -89,15 +89,20 @@ substituteTemplate() {
   echo -n "$result"
 }
 
-if [[ ! -v WIFIREG_USERNAME ]] || \
-  [[ ! -v WIFIREG_PASSWORD_TEMPLATE ]] || \
-  [[ ! -v WIFIREG_SECRETS_FILE ]] || \
-  [[ ! -v WIFIREG_SECRET_NAME ]] || \
-  [[ ! -v WIFIREG_WPA_CTRL ]] || \
-  [[ ! -v WIFIREG_BASE ]]; then
-  echo "WIFIREG_{USERNAME,PASSWORD_TEMPLATE,SECRETS_FILE,SECRET_NAME,WPA_CTRL,BASE} must all be set" >&2
-  exit 1
-fi
+for var in \
+  WIFIREG_USERNAME \
+  WIFIREG_PASSWORD_TEMPLATE \
+  WIFIREG_SECRETS_FILE \
+  WIFIREG_SECRET_NAME \
+  WIFIREG_BACKEND \
+  WIFIREG_WPA_CTRL \
+  WIFIREG_NM_PROFILE \
+  WIFIREG_BASE; do
+  if [[ ! -v $var ]]; then
+    echo "$var must be set" >&2
+    exit 1
+  fi
+done
 
 if [ ! -f "$WIFIREG_SECRETS_FILE" ] \
   || ! grep -q "^${WIFIREG_SECRET_NAME}=" "$WIFIREG_SECRETS_FILE"; then
@@ -110,24 +115,38 @@ if [ ! -f "$WIFIREG_SECRETS_FILE" ] \
   if [ ! -f "$WIFIREG_SECRETS_FILE" ]; then
     touch "$WIFIREG_SECRETS_FILE"
   fi
-  # We run as the wpa_supplicant user, so the secret is owned by us; keep it
-  # readable only by that user.
+  # The service runs as the backend's user (wpa_supplicant or root), so the
+  # secret is owned by that user; keep it readable only by the owner.
   chmod 0600 "$WIFIREG_SECRETS_FILE"
 
   echo "Wifi registration is up, registered user '$WIFIREG_USERNAME'" >&2
   echo "# added by nixVegas.dcWifi" >> "$WIFIREG_SECRETS_FILE"
   echo "${WIFIREG_SECRET_NAME}=$password" >> "$WIFIREG_SECRETS_FILE"
 
-  # Nudge each running wpa_supplicant to re-read its config. The file: ext
-  # password backend re-reads the secret on every lookup, so a reconfigure
-  # (no privileged service restart needed) is enough to pick up the new one.
-  if [ -d "$WIFIREG_WPA_CTRL" ]; then
-    for sock in "$WIFIREG_WPA_CTRL"/*; do
-      [ -S "$sock" ] || continue
-      iface="$(basename "$sock")"
-      # Skip the P2P device control socket; reconfigure on it just hangs.
-      case "$iface" in p2p-dev-*) continue ;; esac
-      wpa_cli -p "$WIFIREG_WPA_CTRL" -i "$iface" reconfigure || true
-    done
-  fi
+  # Nudge the active backend to pick up the new secret.
+  case "$WIFIREG_BACKEND" in
+    wpa_supplicant)
+      # The file: ext_password backend re-reads the secret on every lookup, so a
+      # reconfigure is enough (no privileged service restart, no root).
+      if [ -d "$WIFIREG_WPA_CTRL" ]; then
+        for sock in "$WIFIREG_WPA_CTRL"/*; do
+          [ -S "$sock" ] || continue
+          iface="$(basename "$sock")"
+          # Skip the P2P device control socket; reconfigure on it just hangs.
+          case "$iface" in p2p-dev-*) continue ;; esac
+          wpa_cli -p "$WIFIREG_WPA_CTRL" -i "$iface" reconfigure || true
+        done
+      fi
+      ;;
+    networkmanager)
+      # Re-run the declarative profile generator (it re-substitutes the secret
+      # via envsubst and reloads NetworkManager), then (re)activate the profile.
+      /run/current-system/systemd/bin/systemctl restart NetworkManager-ensure-profiles.service || true
+      nmcli connection up "$WIFIREG_NM_PROFILE" || true
+      ;;
+    *)
+      echo "Unknown WIFIREG_BACKEND '$WIFIREG_BACKEND'" >&2
+      exit 1
+      ;;
+  esac
 fi
