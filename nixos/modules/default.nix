@@ -28,6 +28,9 @@ let
   # wpa_supplicant path. Both configure the same PEAP/MSCHAPV2 DefCon network.
   useNM = config.networking.networkmanager.enable;
 
+  # Only do anything where there's an actual wifi backend to configure.
+  hasBackend = useNM || config.networking.wireless.enable;
+
   # The registration service (and the secret it writes) run as this user: root
   # under NM (to drive nmcli and reload declarative profiles), otherwise the
   # sandboxed wpa_supplicant user.
@@ -132,7 +135,7 @@ in
       nixVegas.dcWifi.randomUsername = mkDefault useNM;
     }
 
-    (mkIf cfg.enable {
+    (mkIf (cfg.enable && hasBackend) {
       systemd.timers."nixvegas-dc-wifi-registration" = {
         wantedBy = [ "timers.target" ];
         timerConfig = {
