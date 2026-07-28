@@ -102,7 +102,11 @@ in
       };
       caCert = mkOption {
         type = types.path;
-        default = ./hellenic-academic-root-ca.crt;
+        default =
+          pkgs.runCommand "hellenic-academic-root-ca.crt" { src = ./hellenic-academic-root-ca.crt; }
+            ''
+              cp $src $out
+            '';
         description = ''
           Root CA cert to use.
         '';
